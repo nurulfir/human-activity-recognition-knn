@@ -1,21 +1,25 @@
-# APLIKASI: Deteksi Aktivitas Manusia dari Sensor Smartphone
-# ALGORITMA : K-Nearest Neighbor (K-NN)
-# ==========================================================
-# Cara kerja K-NN secara sederhana:
-# Bayangkan kita masuk ke ruangan kelas baru. Untuk menebak
-# "anak ini termasuk kelompok mana?", kita lihat K teman
-# terdekat di sekitarnya, lalu ikut suara terbanyak dari
-# mereka. K-NN melakukan hal yang sama, tapi "dekat" diukur
-# dari kemiripan angka-angka sensor.
+# Aplikasi Deteksi Aktivitas Manusia
+# Menggunakan Algoritma K-Nearest Neighbor (K-NN)
 
 import os
+import warnings
+
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+warnings.filterwarnings(
+    "ignore",
+    message=r"Could not find the number of physical cores.*",
+    category=UserWarning,
+)
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import streamlit as st
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, classification_report
@@ -24,43 +28,135 @@ from sklearn.metrics import (
 st.set_page_config(page_title="Deteksi Aktivitas - K-NN", page_icon="🏃", layout="wide")
 
 
-# 1. MEMUAT DATA
+# HELPER: load & parse CSV yang diupload
 @st.cache_data
-def load_data():
-    folder = os.path.dirname(os.path.abspath(__file__))
-    X_train = pd.read_csv(os.path.join(folder, "train/X_train.txt"), sep=r"\s+", header=None)
-    X_test = pd.read_csv(os.path.join(folder, "test/X_test.txt"), sep=r"\s+", header=None)
-    y_train = pd.read_csv(os.path.join(folder, "train/y_train.txt"), sep=r"\s+", header=None)
-    y_test = pd.read_csv(os.path.join(folder, "test/y_test.txt"), sep=r"\s+", header=None)
-    activities = pd.read_csv(
-        os.path.join(folder, "activity_labels.txt"), sep=r"\s+", header=None,
-        names=["id", "label"]
-    )
-    return X_train, X_test, y_train, y_test, activities
+def load_from_csv(file_bytes: bytes):
+    """
+    Baca CSV, pisahkan fitur dari kolom target ('Activity').
+    Kolom 'Subject' dibuang (bukan fitur prediksi).
+    Label string di-encode ke integer.
+    """
+    df = pd.read_csv(pd.io.common.BytesIO(file_bytes))
+
+    # Deteksi kolom target
+    target_col = "Activity"
+    drop_cols = ["Subject", target_col]
+    feature_cols = [c for c in df.columns if c not in drop_cols]
+
+    X = df[feature_cols].values.astype(float)
+    le = LabelEncoder()
+    y_raw = df[target_col].values
+    y = le.fit_transform(y_raw) + 1
+    class_names = list(le.classes_)
+
+    # Simpan kolom Subject untuk split berbasis orang (lebih realistis)
+    subjects = df["Subject"].values if "Subject" in df.columns else None
+
+    return X, y, class_names, df, feature_cols, subjects
 
 
 @st.cache_data
-def preprocess(X_train, X_test, y_train, y_test):
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    y_train_arr = y_train.values.ravel()
-    y_test_arr = y_test.values.ravel()
-    return X_train_scaled, X_test_scaled, y_train_arr, y_test_arr
+def split_and_scale(X_bytes_hash):
+    """
+    Split berdasarkan Subject (orang) jika tersedia — sama seperti split
+    resmi dataset UCI HAR. Ini lebih realistis: model diuji pada orang
+    yang belum pernah dilihat saat training.
+
+    Jika kolom Subject tidak ada, fallback ke random split 80/20.
+    """
+    X        = st.session_state["X_raw"]
+    y        = st.session_state["y_raw"]
+    subjects = st.session_state.get("subjects_raw")
+
+    if subjects is not None:
+        unique_subj = set(np.unique(subjects).tolist())
+
+        # Split resmi UCI HAR — dipilih acak oleh peneliti aslinya,
+        # bukan sekadar 70% urutan pertama. Inilah yang menghasilkan K=10 optimal.
+        UCI_TRAIN = {1,3,5,6,7,8,11,14,15,16,17,19,21,22,23,25,26,27,28,29,30}
+        UCI_TEST  = {2,4,9,10,12,13,18,20,24}
+
+        # Jika subject CSV cocok dengan UCI → pakai split resmi
+        # Jika dataset lain → fallback ke 70% pertama secara urutan
+        if unique_subj <= (UCI_TRAIN | UCI_TEST):
+            train_subj = UCI_TRAIN
+            test_subj  = UCI_TEST
+        else:
+            all_subj   = sorted(unique_subj)
+            n_train    = max(1, int(len(all_subj) * 0.7))
+            train_subj = set(all_subj[:n_train])
+            test_subj  = set(all_subj[n_train:])
+
+        train_mask = np.isin(subjects, list(train_subj))
+        test_mask  = np.isin(subjects, list(test_subj))
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test,  y_test  = X[test_mask],  y[test_mask]
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+    scaler     = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc  = scaler.transform(X_test)
+    return X_train_sc, X_test_sc, y_train, y_test, X_train, X_test
 
 
-X_train, X_test, y_train_df, y_test_df, activities = load_data()
-X_train_scaled, X_test_scaled, y_train, y_test = preprocess(X_train, X_test, y_train_df, y_test_df)
-activity_map = dict(zip(activities["id"], activities["label"]))
-nama_aktivitas = [activity_map[i].replace("_", " ").title() for i in range(1, 7)]
-
-
-# SIDEBAR / MENU NAVIGASI
+# Sidebar
 st.sidebar.title("🏃 Deteksi Aktivitas Manusia")
 st.sidebar.caption("Algoritma K-Nearest Neighbor (K-NN)")
-st.sidebar.markdown("[Sumber Dataset (UCI)](https://archive.ics.uci.edu/dataset/240/human+activity+recognition+using+smartphones)")
+st.sidebar.markdown(
+    "[Sumber Dataset (UCI)](https://archive.ics.uci.edu/dataset/240/"
+    "human+activity+recognition+using+smartphones)"
+)
 st.sidebar.divider()
 
+# ── Upload CSV ──
+st.sidebar.subheader("📂 Upload Dataset")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload file CSV dataset HAR",
+    type=["csv"],
+    help="Pastikan CSV memiliki kolom 'Activity' sebagai label kelas."
+)
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.read()
+    new_hash   = hash(file_bytes)
+    # Hanya proses ulang jika file benar-benar baru (hash berbeda)
+    if new_hash != st.session_state.get("file_hash"):
+        try:
+            X_raw, y_raw, class_names, df_raw, feature_cols, subjects = load_from_csv(file_bytes)
+            st.session_state["X_raw"]        = X_raw
+            st.session_state["y_raw"]        = y_raw
+            st.session_state["class_names"]  = class_names
+            st.session_state["df_raw"]       = df_raw
+            st.session_state["feature_cols"] = feature_cols
+            st.session_state["subjects_raw"] = subjects
+            st.session_state["data_loaded"]  = True
+            st.session_state["file_hash"]    = new_hash
+            # Reset model hanya saat file baru diupload
+            for k in ["model", "y_pred", "k_dipakai", "akurasi_terakhir",
+                      "k_terbaik", "grafik_k", "input_k",
+                      "X_train_sc", "X_test_sc", "y_train", "y_test"]:
+                st.session_state.pop(k, None)
+        except Exception as e:
+            st.sidebar.error(f"❌ Gagal membaca CSV: {e}")
+            st.session_state["data_loaded"] = False
+
+    if st.session_state.get("data_loaded"):
+        X_raw = st.session_state["X_raw"]
+        st.sidebar.success(
+            f"✅ Data berhasil dimuat!\n\n"
+            f"- **{X_raw.shape[0]:,}** baris\n"
+            f"- **{X_raw.shape[1]}** fitur\n"
+            f"- **{len(st.session_state['class_names'])}** kelas"
+        )
+else:
+    if "data_loaded" not in st.session_state:
+        st.session_state["data_loaded"] = False
+
+# ── Navigasi ──
+st.sidebar.divider()
 halaman = st.sidebar.radio("Pilih Tahapan", [
     "🏠 Beranda",
     "1️⃣ Mengenal Data",
@@ -70,7 +166,27 @@ halaman = st.sidebar.radio("Pilih Tahapan", [
     "5️⃣ Coba Prediksi Sendiri",
 ])
 
+# ── Lazy split (hanya dilakukan sekali setelah CSV diupload) ──
+def ensure_split():
+    """Pastikan data sudah di-split & di-scale, simpan ke session_state."""
+    if "X_train_sc" not in st.session_state and st.session_state.get("data_loaded"):
+        fh = st.session_state["file_hash"]
+        res = split_and_scale(fh)
+        (st.session_state["X_train_sc"],
+         st.session_state["X_test_sc"],
+         st.session_state["y_train"],
+         st.session_state["y_test"],
+         st.session_state["X_train_raw"],
+         st.session_state["X_test_raw"]) = res
 
+def need_data_warning():
+    st.warning(
+        "⚠️ Belum ada data. Silakan **upload file CSV** terlebih dahulu "
+        "melalui panel kiri (sidebar)."
+    )
+
+
+# ═════════════════════════════════════════════
 # HALAMAN: BERANDA
 if halaman == "🏠 Beranda":
     st.title("Deteksi Aktivitas Manusia dari Sensor Smartphone")
@@ -101,13 +217,21 @@ if halaman == "🏠 Beranda":
         cukup bandingkan kemiripan.
         """)
     with col2:
-        st.info(
-            "**Ringkasan Data**\n\n"
-            f"- Data latih: **{X_train.shape[0]:,}** baris\n"
-            f"- Data uji: **{X_test.shape[0]:,}** baris\n"
-            f"- Jumlah fitur: **{X_train.shape[1]}**\n"
-            "- Jumlah kelas: **6 aktivitas**"
-        )
+        if st.session_state.get("data_loaded"):
+            X_raw = st.session_state["X_raw"]
+            ensure_split()
+            n_train = len(st.session_state["y_train"])
+            n_test  = len(st.session_state["y_test"])
+            n_class = len(st.session_state["class_names"])
+            st.info(
+                "**Ringkasan Data**\n\n"
+                f"- Data latih: **{n_train:,}** baris\n"
+                f"- Data uji: **{n_test:,}** baris\n"
+                f"- Jumlah fitur: **{X_raw.shape[1]}**\n"
+                f"- Jumlah kelas: **{n_class} aktivitas**"
+            )
+        else:
+            st.info("📂 Upload dataset CSV di sidebar kiri untuk memulai.")
 
     st.divider()
     st.markdown("**Urutan menjelajah aplikasi ini (lihat menu di kiri):**")
@@ -120,9 +244,21 @@ if halaman == "🏠 Beranda":
     """)
 
 
-# HALAMAN 1: MENGENAL DATA
+# Halaman 1 - Mengenal Data
 elif halaman == "1️⃣ Mengenal Data":
     st.title("1️⃣ Mengenal Data")
+
+    if not st.session_state.get("data_loaded"):
+        need_data_warning()
+        st.stop()
+
+    ensure_split()
+    df_raw      = st.session_state["df_raw"]
+    class_names = st.session_state["class_names"]
+    y_train     = st.session_state["y_train"]
+    y_test      = st.session_state["y_test"]
+    X_raw       = st.session_state["X_raw"]
+
     st.markdown("Sebelum diolah, kita lihat dulu bentuk datanya seperti apa.")
 
     with st.expander("📌 Penjelasan Singkat", expanded=True):
@@ -130,38 +266,51 @@ elif halaman == "1️⃣ Mengenal Data":
         - Setiap baris = **satu rekaman gerakan** dari satu orang.
         - Setiap kolom = **satu angka hasil olahan sensor** (561 kolom total).
         - Tidak ada data yang kosong/hilang — datanya sudah bersih dari sumbernya.
-        - Data sudah dipisah: sebagian untuk **belajar** (training),
-          sebagian untuk **diuji** (testing) — supaya penilaiannya adil.
+        - Data dibagi otomatis: **80% untuk belajar** (training),
+          **20% untuk diuji** (testing) — supaya penilaiannya adil.
         """)
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Data Latih (Training)", f"{X_train.shape[0]:,} baris")
-    col2.metric("Data Uji (Testing)", f"{X_test.shape[0]:,} baris")
-    col3.metric("Jumlah Fitur", X_train.shape[1])
+    col1.metric("Data Latih (Training)", f"{len(y_train):,} baris")
+    col2.metric("Data Uji (Testing)",    f"{len(y_test):,} baris")
+    col3.metric("Jumlah Fitur",          X_raw.shape[1])
 
     st.subheader("Contoh Data Mentah (5 baris pertama)")
     st.caption("Angka-angka ini hasil olahan getaran sensor — sulit dibaca manusia, tapi mudah dibaca komputer.")
-    st.dataframe(X_train.head(5).iloc[:, :8], use_container_width=True)
-    st.caption("*(hanya 8 dari 561 kolom yang ditampilkan)*")
+    feature_cols = st.session_state["feature_cols"]
+    st.dataframe(df_raw[feature_cols].head(5).iloc[:, :8], use_container_width=True)
+    st.caption("*(hanya 8 dari {} kolom yang ditampilkan)*".format(len(feature_cols)))
 
     st.subheader("6 Jenis Aktivitas yang Akan Ditebak")
-    tampil_aktivitas = activities.copy()
-    tampil_aktivitas.columns = ["Kode", "Nama Aktivitas"]
-    st.dataframe(tampil_aktivitas, use_container_width=True, hide_index=True)
+    tabel_aktivitas = pd.DataFrame({
+        "Kode": list(range(1, len(class_names) + 1)),
+        "Nama Aktivitas": class_names
+    })
+    st.dataframe(tabel_aktivitas, use_container_width=True, hide_index=True)
 
     st.subheader("Jumlah Data per Aktivitas")
-    jumlah_train = pd.Series(y_train).value_counts().sort_index()
+    label_series = pd.Series(y_train)
+    counts = label_series.value_counts().sort_index()
     tabel_jumlah = pd.DataFrame({
-        "Aktivitas": [activity_map[i] for i in jumlah_train.index],
-        "Jumlah Data Latih": jumlah_train.values
+        "Aktivitas": [class_names[i - 1] for i in counts.index],
+        "Jumlah Data Latih": counts.values
     })
     st.dataframe(tabel_jumlah, use_container_width=True, hide_index=True)
     st.caption("Jumlah tiap aktivitas cukup seimbang, jadi model tidak akan bias ke satu aktivitas saja.")
 
 
-# HALAMAN 2: MENYIAPKAN DATA
+# Halaman 2 - Menyiapkan Data
 elif halaman == "2️⃣ Menyiapkan Data":
     st.title("2️⃣ Menyiapkan Data (Preprocessing)")
+
+    if not st.session_state.get("data_loaded"):
+        need_data_warning()
+        st.stop()
+
+    ensure_split()
+    X_train_raw = st.session_state["X_train_raw"]
+    X_train_sc  = st.session_state["X_train_sc"]
+    X_test_sc   = st.session_state["X_test_sc"]
 
     with st.expander("📌 Penjelasan Singkat", expanded=True):
         st.markdown("""
@@ -176,28 +325,45 @@ elif halaman == "2️⃣ Menyiapkan Data":
         """)
 
     st.subheader("Langkah 1 — Cek Data Kosong")
-    col1, col2 = st.columns(2)
-    col1.success(f"✅ Data latih: {X_train.isnull().sum().sum()} nilai kosong")
-    col2.success(f"✅ Data uji: {X_test.isnull().sum().sum()} nilai kosong")
-    st.caption("Tidak ada nilai kosong sama sekali — data sudah bersih, tidak perlu diperbaiki.")
+    df_raw = st.session_state["df_raw"]
+    null_total = df_raw.isnull().sum().sum()
+    if null_total == 0:
+        st.success(f"✅ Tidak ada nilai kosong sama sekali ({null_total} missing values) — data sudah bersih.")
+    else:
+        st.warning(f"⚠️ Ditemukan {null_total} nilai kosong. Pertimbangkan imputasi sebelum melatih model.")
 
     st.subheader("Langkah 2 — Standardisasi Skala")
     col1, col2 = st.columns(2)
     with col1:
-        st.write("**Sebelum** distandardisasi:")
-        st.dataframe(X_train.iloc[:5, :4].describe().loc[["mean", "std", "min", "max"]], use_container_width=True)
-    with col2:
-        st.write("**Sesudah** distandardisasi:")
+        st.write("**Sebelum** distandardisasi (4 fitur pertama):")
+        df_before = pd.DataFrame(X_train_raw[:, :4])
         st.dataframe(
-            pd.DataFrame(X_train_scaled[:, :4]).describe().loc[["mean", "std", "min", "max"]],
+            df_before.describe().loc[["mean", "std", "min", "max"]],
+            use_container_width=True
+        )
+    with col2:
+        st.write("**Sesudah** distandardisasi (4 fitur pertama):")
+        df_after = pd.DataFrame(X_train_sc[:, :4])
+        st.dataframe(
+            df_after.describe().loc[["mean", "std", "min", "max"]],
             use_container_width=True
         )
     st.caption("Setelah distandardisasi, rata-rata setiap kolom mendekati 0 — semua fitur jadi 'setara'.")
 
 
-# HALAMAN 3: MELATIH MODEL K-NN
+# Halaman 3 - Melatih Model K-NN
 elif halaman == "3️⃣ Melatih Model K-NN":
     st.title("3️⃣ Melatih Model K-NN")
+
+    if not st.session_state.get("data_loaded"):
+        need_data_warning()
+        st.stop()
+
+    ensure_split()
+    X_train_sc = st.session_state["X_train_sc"]
+    X_test_sc  = st.session_state["X_test_sc"]
+    y_train    = st.session_state["y_train"]
+    y_test     = st.session_state["y_test"]
 
     with st.expander("📌 Penjelasan Singkat", expanded=True):
         st.markdown("""
@@ -216,19 +382,19 @@ elif halaman == "3️⃣ Melatih Model K-NN":
     st.subheader("Langkah A (Opsional) — Cari Nilai K Terbaik Otomatis")
     if st.button("🔍 Cari K Terbaik", use_container_width=True):
         with st.spinner("Mencoba K = 1 sampai 15..."):
-            daftar_k = range(1, 16)
+            daftar_k       = range(1, 16)
             daftar_akurasi = []
-            progres = st.progress(0)
+            progres        = st.progress(0)
             for i, k_coba in enumerate(daftar_k):
-                model_coba = KNeighborsClassifier(n_neighbors=k_coba, n_jobs=-1)
-                model_coba.fit(X_train_scaled, y_train)
-                pred_coba = model_coba.predict(X_test_scaled)
+                model_coba = KNeighborsClassifier(n_neighbors=k_coba, n_jobs=1)
+                model_coba.fit(X_train_sc, y_train)
+                pred_coba = model_coba.predict(X_test_sc)
                 daftar_akurasi.append(accuracy_score(y_test, pred_coba))
                 progres.progress((i + 1) / len(daftar_k))
 
             k_terbaik = list(daftar_k)[int(np.argmax(daftar_akurasi))]
             st.session_state["k_terbaik"] = k_terbaik
-            st.session_state["grafik_k"] = (list(daftar_k), daftar_akurasi, k_terbaik)
+            st.session_state["grafik_k"]  = (list(daftar_k), daftar_akurasi, k_terbaik)
 
     if "grafik_k" in st.session_state:
         daftar_k, daftar_akurasi, k_terbaik = st.session_state["grafik_k"]
@@ -248,30 +414,58 @@ elif halaman == "3️⃣ Melatih Model K-NN":
     st.divider()
     st.subheader("Langkah B — Latih Model dengan Nilai K Pilihanmu")
 
-    k_default = st.session_state.get("k_terbaik", 5)
-    k = st.slider("Pilih jumlah tetangga (K)", min_value=1, max_value=20, value=k_default)
+    # Pakai number_input sebagai pengganti slider — nilainya tidak di-reset Streamlit saat rerun.
+    # Saat k_terbaik baru ditemukan (Langkah A), tombol "Pakai K Terbaik" memperbarui nilainya.
+    if "input_k" not in st.session_state:
+        st.session_state["input_k"] = st.session_state.get("k_terbaik", 10)
+
+    if "k_terbaik" in st.session_state:
+        col_info, col_btn = st.columns([3, 1])
+        col_info.info(f"K terbaik hasil pencarian: **K = {st.session_state['k_terbaik']}**")
+        if col_btn.button("⬅️ Pakai K Terbaik"):
+            st.session_state["input_k"] = st.session_state["k_terbaik"]
+            st.rerun()
+
+    k = st.slider("Pilih jumlah tetangga (K)", min_value=1, max_value=20,
+                  value=st.session_state["input_k"], key="slider_k_widget")
+    st.session_state["input_k"] = k   # simpan setiap perubahan manual
 
     if st.button("🚀 Latih Model Sekarang", type="primary", use_container_width=True):
         with st.spinner(f"Melatih model K-NN dengan K = {k} ..."):
-            model = KNeighborsClassifier(n_neighbors=k, n_jobs=-1)
-            model.fit(X_train_scaled, y_train)
-            y_pred = model.predict(X_test_scaled)
-
-            st.session_state["model"] = model
-            st.session_state["y_pred"] = y_pred
-            st.session_state["k_dipakai"] = k
-
+            model  = KNeighborsClassifier(n_neighbors=k, n_jobs=1)
+            model.fit(X_train_sc, y_train)
+            y_pred = model.predict(X_test_sc)
             akurasi = accuracy_score(y_test, y_pred)
-            st.success(f"🎉 Model selesai dilatih! Akurasi pada data uji: **{akurasi:.2%}**")
+
+        # Di luar spinner supaya pesan tidak hilang saat rerun
+        st.session_state["model"]     = model
+        st.session_state["y_pred"]    = y_pred
+        st.session_state["k_dipakai"] = k
+        st.session_state["akurasi_terakhir"] = akurasi
 
     if "model" in st.session_state:
-        st.info(f"Model aktif saat ini menggunakan **K = {st.session_state['k_dipakai']}**. "
-                "Lanjut ke menu **4️⃣ Menguji Hasil Model** untuk melihat detail performanya.")
+        st.success(f"🎉 Model selesai dilatih! Akurasi pada data uji: **{st.session_state['akurasi_terakhir']:.2%}**")
+        st.info(
+            f"Model aktif saat ini menggunakan **K = {st.session_state['k_dipakai']}**. "
+            "Lanjut ke menu **4️⃣ Menguji Hasil Model** untuk melihat detail performanya."
+        )
 
 
-# HALAMAN 4: MENGUJI HASIL MODEL
+# Halaman 4 - Menguji Hasil Model
 elif halaman == "4️⃣ Menguji Hasil Model":
     st.title("4️⃣ Menguji Hasil Model")
+
+    if not st.session_state.get("data_loaded"):
+        need_data_warning()
+        st.stop()
+
+    ensure_split()
+    X_train_sc  = st.session_state["X_train_sc"]
+    X_test_sc   = st.session_state["X_test_sc"]
+    y_train     = st.session_state["y_train"]
+    y_test      = st.session_state["y_test"]
+    class_names = st.session_state["class_names"]
+    nama_aktivitas = [n.replace("_", " ").title() for n in class_names]
 
     with st.expander("📌 Penjelasan Singkat", expanded=True):
         st.markdown("""
@@ -287,12 +481,12 @@ elif halaman == "4️⃣ Menguji Hasil Model":
 
     if "model" not in st.session_state:
         st.warning("⚠️ Model belum dilatih. Silakan ke menu **3️⃣ Melatih Model K-NN** terlebih dahulu, "
-                    "atau klik tombol di bawah untuk memakai pengaturan default.")
+                   "atau klik tombol di bawah untuk memakai pengaturan default.")
         if st.button("Latih Model Default (K=5)"):
-            model = KNeighborsClassifier(n_neighbors=5, n_jobs=-1)
-            model.fit(X_train_scaled, y_train)
-            st.session_state["model"] = model
-            st.session_state["y_pred"] = model.predict(X_test_scaled)
+            model  = KNeighborsClassifier(n_neighbors=5, n_jobs=1)
+            model.fit(X_train_sc, y_train)
+            st.session_state["model"]     = model
+            st.session_state["y_pred"]    = model.predict(X_test_sc)
             st.session_state["k_dipakai"] = 5
             st.rerun()
     else:
@@ -301,17 +495,21 @@ elif halaman == "4️⃣ Menguji Hasil Model":
 
         st.subheader("Ringkasan Performa")
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Akurasi", f"{accuracy_score(y_test, y_pred):.2%}")
+        col1.metric("Akurasi",   f"{accuracy_score(y_test, y_pred):.2%}")
         col2.metric("Precision", f"{precision_score(y_test, y_pred, average='weighted'):.2%}")
-        col3.metric("Recall", f"{recall_score(y_test, y_pred, average='weighted'):.2%}")
-        col4.metric("F1-Score", f"{f1_score(y_test, y_pred, average='weighted'):.2%}")
+        col3.metric("Recall",    f"{recall_score(y_test, y_pred, average='weighted'):.2%}")
+        col4.metric("F1-Score",  f"{f1_score(y_test, y_pred, average='weighted'):.2%}")
 
         st.subheader("Confusion Matrix (Tabel Tebakan vs Kenyataan)")
-        cm = confusion_matrix(y_test, y_pred)
+        # Urutkan label sesuai class_names
+        unique_labels = sorted(np.unique(y_test))
+        tick_labels   = [class_names[i - 1].replace("_", " ").title() for i in unique_labels]
+        cm = confusion_matrix(y_test, y_pred, labels=unique_labels)
+
         fig, ax = plt.subplots(figsize=(8, 6))
         sns.heatmap(
             cm, annot=True, fmt="d", cmap="Blues",
-            xticklabels=nama_aktivitas, yticklabels=nama_aktivitas,
+            xticklabels=tick_labels, yticklabels=tick_labels,
             linewidths=0.5, ax=ax
         )
         ax.set_xlabel("Tebakan Model")
@@ -335,14 +533,31 @@ elif halaman == "4️⃣ Menguji Hasil Model":
 
         with st.expander("Lihat detail per aktivitas (tabel lengkap)"):
             report = classification_report(
-                y_test, y_pred, target_names=nama_aktivitas, output_dict=True, digits=3
+                y_test, y_pred,
+                labels=unique_labels,
+                target_names=tick_labels,
+                output_dict=True,
+                digits=3
             )
             st.dataframe(pd.DataFrame(report).transpose(), use_container_width=True)
 
 
-# HALAMAN 5: COBA PREDIKSI SENDIRI
+# Halaman 5 - Coba Prediksi Sendiri 
 elif halaman == "5️⃣ Coba Prediksi Sendiri":
     st.title("5️⃣ Coba Prediksi Sendiri")
+
+    if not st.session_state.get("data_loaded"):
+        need_data_warning()
+        st.stop()
+
+    ensure_split()
+    X_train_sc  = st.session_state["X_train_sc"]
+    X_test_sc   = st.session_state["X_test_sc"]
+    y_train     = st.session_state["y_train"]
+    y_test      = st.session_state["y_test"]
+    class_names = st.session_state["class_names"]
+    nama_aktivitas = [n.replace("_", " ").title() for n in class_names]
+
     st.markdown("""
     Pilih salah satu data uji di bawah, lalu lihat tebakan model dibandingkan
     dengan jawaban yang sebenarnya. Ini menunjukkan model **bekerja secara nyata**,
@@ -351,34 +566,35 @@ elif halaman == "5️⃣ Coba Prediksi Sendiri":
 
     if "model" not in st.session_state:
         st.warning("⚠️ Model belum dilatih. Silakan ke menu **3️⃣ Melatih Model K-NN** terlebih dahulu, "
-                    "atau klik tombol di bawah untuk memakai pengaturan default.")
+                   "atau klik tombol di bawah untuk memakai pengaturan default.")
         if st.button("Latih Model Default (K=5)"):
-            model = KNeighborsClassifier(n_neighbors=5, n_jobs=-1)
-            model.fit(X_train_scaled, y_train)
-            st.session_state["model"] = model
-            st.session_state["y_pred"] = model.predict(X_test_scaled)
+            model  = KNeighborsClassifier(n_neighbors=5, n_jobs=1)
+            model.fit(X_train_sc, y_train)
+            st.session_state["model"]     = model
+            st.session_state["y_pred"]    = model.predict(X_test_sc)
             st.session_state["k_dipakai"] = 5
             st.rerun()
     else:
         model = st.session_state["model"]
 
         nomor_data = st.number_input(
-            f"Pilih nomor data uji (0 sampai {len(X_test_scaled) - 1})",
-            min_value=0, max_value=len(X_test_scaled) - 1, value=0, step=1
+            f"Pilih nomor data uji (0 sampai {len(X_test_sc) - 1})",
+            min_value=0, max_value=len(X_test_sc) - 1, value=0, step=1
         )
 
         if st.button("🔮 Tebak Aktivitas", type="primary", use_container_width=True):
-            data_pilihan = X_test_scaled[nomor_data].reshape(1, -1)
-            label_asli = int(y_test[nomor_data])
-            label_tebakan = int(model.predict(data_pilihan)[0])
-            proba = model.predict_proba(data_pilihan)[0]
+            data_pilihan   = X_test_sc[nomor_data].reshape(1, -1)
+            label_asli     = int(y_test[nomor_data])
+            label_tebakan  = int(model.predict(data_pilihan)[0])
+            proba          = model.predict_proba(data_pilihan)[0]
 
-            aktivitas_asli = activity_map[label_asli]
-            aktivitas_tebakan = activity_map[label_tebakan]
+            # Ambil nama aktivitas dari class_names (1-indexed)
+            aktivitas_asli    = class_names[label_asli - 1]
+            aktivitas_tebakan = class_names[label_tebakan - 1]
 
             col1, col2 = st.columns(2)
             col1.metric("Aktivitas Sebenarnya", aktivitas_asli)
-            col2.metric("Tebakan Model", aktivitas_tebakan)
+            col2.metric("Tebakan Model",        aktivitas_tebakan)
 
             if label_asli == label_tebakan:
                 st.success("✅ Model menebak dengan BENAR!")
@@ -386,14 +602,24 @@ elif halaman == "5️⃣ Coba Prediksi Sendiri":
                 st.error("❌ Model menebak SALAH — wajar, tidak ada model yang 100% sempurna.")
 
             st.subheader("Tingkat Keyakinan Model untuk Tiap Aktivitas")
-            warna = ["#22c55e" if i + 1 == label_tebakan else "#e2e8f0" for i in range(6)]
+            # Sesuaikan jumlah warna dengan jumlah kelas di model
+            model_classes = list(model.classes_)
+            warna = [
+                "#22c55e" if cls == label_tebakan else "#e2e8f0"
+                for cls in model_classes
+            ]
+            tick_labels = [class_names[c - 1].replace("_", " ").title() for c in model_classes]
+
             fig, ax = plt.subplots(figsize=(9, 4))
-            bars = ax.bar(nama_aktivitas, proba, color=warna, edgecolor="#94a3b8")
+            bars = ax.bar(tick_labels, proba, color=warna, edgecolor="#94a3b8")
             ax.set_ylabel("Probabilitas")
             ax.set_ylim(0, 1)
             for bar, p in zip(bars, proba):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-                        f"{p:.0%}", ha="center", fontsize=10)
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.02,
+                    f"{p:.0%}", ha="center", fontsize=10
+                )
             plt.xticks(rotation=20, ha="right")
             plt.tight_layout()
             st.pyplot(fig)
